@@ -4,15 +4,121 @@ from PIL import Image
 import io
 import base64
 import re
+import gspread
+import json
 
 # Configure the OpenRouter API with your key
-# Note: You need to get your own API key from OpenRouter
-# and set it as a secret in your Streamlit app with the key OPENROUTER_API_KEY.
 api_key = st.secrets["OPENROUTER_API_KEY"]
 client = openai.OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=api_key,
 )
+
+import gspread
+import json
+from google.oauth2.service_account import Credentials
+import traceback
+from datetime import datetime
+import pandas as pd
+
+# --- Google Sheets Connection ---
+@st.cache_resource
+def init_gspread_client():
+    """Initializes and returns an authorized gspread client."""
+    try:
+        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive.file"]
+        creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
+        return gspread.authorize(creds)
+    except Exception as e:
+        st.error(f"Error connecting to Google Sheets: {e}")
+        return None
+
+def get_worksheet_by_name(_client, sheet_url, worksheet_name):
+    """Gets a specific worksheet from a spreadsheet."""
+    if _client is None:
+        return None
+    try:
+        spreadsheet = _client.open_by_url(sheet_url)
+        return spreadsheet.worksheet(worksheet_name)
+    except gspread.exceptions.WorksheetNotFound:
+        st.error(f"Worksheet '{worksheet_name}' not found. Please ensure it exists in your Google Sheet.")
+        return None
+    except Exception as e:
+        st.error(f"Error opening worksheet '{worksheet_name}': {e}")
+        return None
+
+# Initialize client and get worksheets
+g_client = init_gspread_client()
+SHEET_URL = "https://docs.google.com/spreadsheets/d/1ssxshfUjC9gJ_6oUyhtuoWgDizLx43-sjbqhZnAxlBo/edit?gid=0#gid=0"
+counter_sheet = get_worksheet_by_name(g_client, SHEET_URL, "Counter")
+feedback_sheet = get_worksheet_by_name(g_client, SHEET_URL, "Feedback")
+
+
+# --- Feedback Logic ---
+def add_feedback(sheet, vote, comment):
+    """Adds a new row of feedback to the sheet."""
+    if sheet is None:
+        st.error("Could not connect to Feedback sheet. Please try again later.")
+        return False
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sheet.append_row([timestamp, vote, comment])
+        # Clear the cache for the feedback display function so we get fresh data
+        get_all_feedback.clear()
+        return True
+    except Exception as e:
+        st.error(f"Failed to submit feedback: {e}")
+        return False
+
+@st.cache_data(ttl=60)
+def get_all_feedback(_sheet):
+    """Retrieves all feedback and returns as a DataFrame."""
+    if _sheet is None:
+        return pd.DataFrame()
+    try:
+        data = _sheet.get_all_values()
+        if len(data) < 2: # Only headers or empty
+            return pd.DataFrame(columns=["Timestamp", "Vote", "Comment"])
+        
+        headers = data[0]
+        df = pd.DataFrame(data[1:], columns=headers)
+        return df
+    except Exception as e:
+        st.error(f"Failed to retrieve feedback: {e}")
+        return pd.DataFrame()
+
+counter_sheet = get_worksheet_by_name(g_client, SHEET_URL, "Counter")
+
+def get_count(sheet):
+    if sheet is None:
+        return 0
+    try:
+        value = sheet.acell('A1').value
+        if value is None:
+            return 0  # If cell is empty, treat count as 0
+        return int(value)
+    except (ValueError, TypeError):
+        # If value is not a number, reset to 0
+        st.warning("Counter value in sheet was invalid. Resetting to 0.")
+        sheet.update('A1', 0)
+        return 0
+    except Exception as e:
+        st.error(f"Error getting count from sheet: {e}")
+        return 0 # Return 0 on other errors
+
+def update_count(sheet, count):
+    if sheet is None:
+        return
+    try:
+        sheet.update('A1', [[count]])
+    except Exception as e:
+        st.error(f"Error updating count in sheet: {e}")
+
+# Initialize session state for the counter
+if 'count' not in st.session_state:
+    st.session_state.count = get_count(counter_sheet)
+# --- End of Persistent Counter Setup ---
+
 
 st.set_page_config(layout="wide")
 
@@ -60,7 +166,7 @@ st.markdown("""
     }
 
     /* Header and subheader colors */
-h1 {
+    h1 {
         color: red; /* Homework Helper red */
     }
     h2, h3 {
@@ -75,19 +181,22 @@ st.title("Homework Helper")
 # Initialize session state
 if 'response_text' not in st.session_state:
     st.session_state.response_text = None
-if 'click_count' not in st.session_state:
-    st.session_state.click_count = 0
 
 left_panel, right_panel = st.columns([1, 3])
 
 with left_panel:
-    st.subheader("Upload your homework") # Changed from st.header to st.subheader
+    st.subheader("Upload your homework")
     uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "png", "jpeg"])
     if uploaded_file is not None:
         st.image(uploaded_file, caption="Uploaded homework question.", use_container_width=True)
 
         if st.button("Help Me!"):
-            st.session_state.click_count += 1 # Increment counter
+            # Increment persistent counter by reading from the sheet directly
+            current_count = get_count(counter_sheet)
+            new_count = current_count + 1
+            update_count(counter_sheet, new_count)
+            st.session_state.count = new_count # Update session state for immediate display
+            
             # Create the prompt
             prompt = (
                 "You are a school teacher. Your task is to help students understand and solve the question in the image.\n\n"
@@ -105,15 +214,9 @@ with left_panel:
             # Prepare the image for the model
             image = Image.open(uploaded_file)
             buffered = io.BytesIO()
-            # Correctly determine the format, defaulting to JPEG if type is not standard
             image_format = uploaded_file.type.split('/')[1].upper()
-            if image_format == 'JPEG':
-                image_format = 'JPEG' # Keep it as JPEG
-            elif image_format == 'PNG':
-                image_format = 'PNG'
-            else:
-                image_format = 'JPEG' # Default to JPEG for other types
-            
+            if image_format not in ['JPEG', 'PNG']:
+                image_format = 'JPEG'
             image.save(buffered, format=image_format)
             img_str = base64.b64encode(buffered.getvalue()).decode()
 
@@ -121,7 +224,8 @@ with left_panel:
             # Generate the content
             try:
                 response = client.chat.completions.create(
-                    model="google/gemini-2.5-pro",
+#                    model="google/gemini-2.5-pro",
+                    model="google/gemini-2.5-flash",
                     messages=[
                         {
                             "role": "user",
@@ -142,7 +246,57 @@ with left_panel:
                 st.error(f"An error occurred: {e}")
     
     st.markdown(f"---")
-    st.write(f"Tool used: **{st.session_state.click_count}** times")
+    st.write(f"Tool used: **{st.session_state.count}** times")
+
+
+
+    # --- Feedback Section ---
+    st.markdown("---")
+    st.subheader("Feedback")
+
+    # --- Display Logic ---
+    if feedback_sheet:
+        feedback_df = get_all_feedback(feedback_sheet)
+        if not feedback_df.empty:
+            valid_votes = feedback_df[feedback_df['Vote'].isin(['👍', '👎'])]
+            thumbs_up_count = (valid_votes['Vote'] == '👍').sum()
+            thumbs_down_count = (valid_votes['Vote'] == '👎').sum()
+            st.write(f"**Overall Rating:** {int(thumbs_up_count)} 👍 | {int(thumbs_down_count)} 👎")
+        else:
+            st.write("No feedback submitted yet.")
+
+    # --- Submission Logic ---
+    with st.form("feedback_form", clear_on_submit=True):
+        vote = st.radio(
+            "Choose your rating:",
+            ('👍', '👎'),
+            horizontal=True,
+            index=None, # Default to no selection
+        )
+        comment = st.text_area("Leave a comment (optional)")
+        
+        submitted = st.form_submit_button("Send Feedback")
+
+        if submitted:
+            if vote is None:
+                st.warning("Please select a rating (👍 or 👎) before sending.")
+            else:
+                if add_feedback(feedback_sheet, vote, comment):
+                    st.success("Thank you for your feedback!")
+                    st.rerun()
+                else:
+                    st.error("Sorry, there was an issue submitting your feedback.")
+
+    # --- Display Comments ---
+    if feedback_sheet and 'feedback_df' in locals() and not feedback_df.empty:
+        comments_df = feedback_df[feedback_df['Comment'].str.strip() != ''].copy()
+        if not comments_df.empty:
+            with st.expander(f"View All Comments ({len(comments_df)})"):
+                comments_df_sorted = comments_df.sort_values(by="Timestamp", ascending=False)
+                for index, row in comments_df_sorted.iterrows():
+                    st.markdown(f"**{row['Vote']}** `({row['Timestamp']})`")
+                    if row['Comment']:
+                        st.info(f"{row['Comment']}")
 
 
 with right_panel:
